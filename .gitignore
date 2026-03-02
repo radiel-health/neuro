@@ -1,0 +1,10 @@
+**/data
+**/slice_outputs
+**/slice_outputs_nifti
+**/DS_Store
+**/ipynb_checkpoints
+**/logs
+**/__pycache__
+**/stage1
+**/.vscode
+**/.venv
