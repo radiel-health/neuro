@@ -5,13 +5,25 @@ import pandas as pd
 from utils import INV_LABELS, load_seg, vox2world
 
 
-def centroid_world(seg, aff, label):
-    ijk = np.argwhere(seg == label)
+def centroid_world_from_ijk(ijk, aff):
     if ijk.size == 0:
         return None
     xyz = vox2world(aff, ijk)
     c = np.median(xyz, axis=0)
     return c
+
+
+def build_label_ijk_map(seg):
+    fg = np.argwhere(seg > 0)
+    if fg.size == 0:
+        return {}
+    labels = seg[fg[:, 0], fg[:, 1], fg[:, 2]].astype(np.int16)
+    out = {}
+    for lab in range(1, 18):
+        m = labels == lab
+        if np.any(m):
+            out[lab] = fg[m]
+    return out
 
 
 def fit_line(z, v):
@@ -81,10 +93,12 @@ def local_subluxation_flags(levels, x, y, z, thresh_mm):
 
 def compute_patient_alignment(seg_path, translation_thresh_mm, scoliosis_max_dev_mm, kyphosis_max_dev_mm):
     seg, aff = load_seg(seg_path)
+    label_ijk = build_label_ijk_map(seg)
 
     pts = []
     for lab in range(1, 18):
-        c = centroid_world(seg, aff, lab)
+        ijk = label_ijk.get(lab, np.empty((0, 3), dtype=np.int64))
+        c = centroid_world_from_ijk(ijk, aff)
         if c is None:
             continue
         # canonical axis assumption after as_closest_canonical:

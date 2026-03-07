@@ -16,14 +16,24 @@ from utils import DEFAULT_DATA_ROOT
 CSV_PATH = "data/vertebra_dataset.csv"
 ROOT_DIR = DEFAULT_DATA_ROOT
 
-BATCH_SIZE = 4
+BATCH_SIZE = 16
 EPOCHS = 20
-LR = 1e-3
+LR = 1e-4
 TRAIN_RATIO = 0.8
 VAL_RATIO = 0.1
 SEED = 42
+NUM_WORKERS = 0
+PIN_MEMORY = False
+USE_PATCH_CACHE = True
+PREBUILD_PATCH_CACHE = True
+PATCH_CACHE_DIR = "data/vertebra_patch_cache"
+PATIENT_CACHE_SIZE = 1
+PATCH_SIZE = (96, 96, 96)
+NORM_MODE = "zscore_sigmoid"
+ZSCORE_SCALE = 1.5
+FOREGROUND_FLOOR = 0.15
 RUN_DATE = datetime.now().strftime("%Y-%m-%d")
-OUTPUT_DIR = Path("stage1") / RUN_DATE
+OUTPUT_DIR = Path("output/stage1") / RUN_DATE
 BEST_MODEL_PATH = OUTPUT_DIR / "best.pth"
 LAST_MODEL_PATH = OUTPUT_DIR / "last.pth"
 HISTORY_PATH = OUTPUT_DIR / "history.csv"
@@ -64,6 +74,8 @@ def make_loader(subset, shuffle=False):
         subset,
         batch_size=BATCH_SIZE,
         shuffle=shuffle,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY,
     )
 
 
@@ -136,7 +148,24 @@ def compute_class_weights(df, indices, num_classes=4):
     return weights, counts
 
 
-dataset = VertebraDataset(csv_path=CSV_PATH, root_dir=ROOT_DIR)
+dataset = VertebraDataset(
+    csv_path=CSV_PATH,
+    root_dir=ROOT_DIR,
+    use_patch_cache=USE_PATCH_CACHE,
+    cache_dir=PATCH_CACHE_DIR,
+    patient_cache_size=PATIENT_CACHE_SIZE,
+    patch_size=PATCH_SIZE,
+    norm_mode=NORM_MODE,
+    zscore_scale=ZSCORE_SCALE,
+    foreground_floor=FOREGROUND_FLOOR,
+)
+if PREBUILD_PATCH_CACHE and USE_PATCH_CACHE:
+    start_time = datetime.now()
+    print(f"Precomputing patch cache -> {PATCH_CACHE_DIR}")
+    dataset.precompute_cache(force=False, verbose=True)
+    end_time = datetime.now()
+    print(f"Precomputation time: {end_time - start_time}")
+
 train_idx, val_idx, test_idx = build_patient_splits(dataset)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -168,6 +197,16 @@ params = {
     "val_ratio": VAL_RATIO,
     "seed": SEED,
     "device": DEVICE,
+    "num_workers": NUM_WORKERS,
+    "pin_memory": PIN_MEMORY,
+    "use_patch_cache": USE_PATCH_CACHE,
+    "prebuild_patch_cache": PREBUILD_PATCH_CACHE,
+    "patch_cache_dir": PATCH_CACHE_DIR,
+    "patient_cache_size": PATIENT_CACHE_SIZE,
+    "patch_size": list(PATCH_SIZE),
+    "norm_mode": NORM_MODE,
+    "zscore_scale": ZSCORE_SCALE,
+    "foreground_floor": FOREGROUND_FLOOR,
     "num_classes": 4,
     "train_samples": len(train_set),
     "val_samples": len(val_set),

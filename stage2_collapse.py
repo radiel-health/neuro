@@ -6,8 +6,7 @@ from utils import VERTEBRA_LABELS, INV_LABELS, load_seg, vox2world
 
 LIT_FILE = "data/vertebra_height.csv"
 
-def measure_height(seg, aff, label):
-    ijk = np.argwhere(seg == label)
+def measure_height_from_ijk(ijk, aff):
     if ijk.size == 0:
         return None
     xyz = vox2world(aff, ijk)
@@ -41,6 +40,25 @@ def measure_height(seg, aff, label):
         return None
 
     return h_ant, h_post
+
+
+def measure_height(seg, aff, label):
+    ijk = np.argwhere(seg == label)
+    return measure_height_from_ijk(ijk, aff)
+
+
+def build_label_ijk_map(seg):
+    """Build per-label voxel coordinates with a single pass over segmentation."""
+    fg = np.argwhere(seg > 0)
+    if fg.size == 0:
+        return {}
+    labels = seg[fg[:, 0], fg[:, 1], fg[:, 2]].astype(np.int16)
+    out = {}
+    for lab in range(1, 18):
+        m = labels == lab
+        if np.any(m):
+            out[lab] = fg[m]
+    return out
 
 def collapse_score(r):
     if r < 0.5:
@@ -77,8 +95,10 @@ def run_batch(root):
             continue
 
         seg, aff = load_seg(seg_path)
+        label_ijk = build_label_ijk_map(seg)
         for lab in range(1,18):
-            res = measure_height(seg, aff, lab)
+            ijk = label_ijk.get(lab, np.empty((0, 3), dtype=np.int64))
+            res = measure_height_from_ijk(ijk, aff)
             if res is None:
                 continue
             h_ant, h_post = res

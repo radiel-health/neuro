@@ -52,6 +52,63 @@ def crop_from_mask(vol, mask, label, margin=5):
 
     return vol[z0:z1, y0:y1, x0:x1]
 
+
+def extract_centered_label_cube(vol, mask, label, size=(64, 64, 64)):
+    """Keep only the requested label voxels and center them in a fixed-size zero-padded cube."""
+    if vol.shape != mask.shape:
+        # Some studies have slight CT/SEG size mismatches; use the overlapping region.
+        common_shape = tuple(min(v, m) for v, m in zip(vol.shape, mask.shape))
+        vol = vol[:common_shape[0], :common_shape[1], :common_shape[2]]
+        mask = mask[:common_shape[0], :common_shape[1], :common_shape[2]]
+
+    target_mask = mask == label
+    if not np.any(target_mask):
+        return np.zeros((1, size[0], size[1], size[2]), dtype=np.float32)
+
+    isolated = np.where(target_mask, vol, 0.0)
+    coords = np.argwhere(target_mask)
+
+    mins = coords.min(axis=0)
+    maxs = coords.max(axis=0) + 1
+    src = isolated[mins[0]:maxs[0], mins[1]:maxs[1], mins[2]:maxs[2]].astype(np.float32)
+
+    # If the vertebra crop is larger than target cube, shrink it first to avoid truncation.
+    src_shape = src.shape
+    if any(src_shape[d] > size[d] for d in range(3)):
+        scale = min(size[d] / src_shape[d] for d in range(3))
+        new_shape = tuple(max(1, int(round(src_shape[d] * scale))) for d in range(3))
+        src_t = torch.from_numpy(src).float()[None, None]
+        src = F.interpolate(
+            src_t,
+            size=new_shape,
+            mode="trilinear",
+            align_corners=False,
+        )[0, 0].cpu().numpy()
+
+    out = np.zeros(size, dtype=np.float32)
+    src_shape = src.shape
+
+    src_slices = []
+    dst_slices = []
+    for dim, dim_size in enumerate(size):
+        src_dim = src_shape[dim]
+        if src_dim <= dim_size:
+            dst_start = (dim_size - src_dim) // 2
+            dst_end = dst_start + src_dim
+            src_start = 0
+            src_end = src_dim
+        else:
+            src_start = (src_dim - dim_size) // 2
+            src_end = src_start + dim_size
+            dst_start = 0
+            dst_end = dim_size
+
+        src_slices.append(slice(src_start, src_end))
+        dst_slices.append(slice(dst_start, dst_end))
+
+    out[dst_slices[0], dst_slices[1], dst_slices[2]] = src[src_slices[0], src_slices[1], src_slices[2]]
+    return out[None, ...]
+
 def resize_patch(patch, size=(64, 64, 64)):
     t = torch.tensor(patch).float()[None, None]
     t = F.interpolate(
