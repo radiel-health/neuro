@@ -1,12 +1,14 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from pathlib import Path
 from collections import Counter
 import csv
 import json
 from datetime import datetime
 import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report
+from sklearn.model_selection import train_test_split
 
 from dataset_class import VertebraDataset
 from monai.networks.nets import DenseNet121
@@ -17,10 +19,14 @@ CSV_PATH = "data/vertebra_dataset.csv"
 ROOT_DIR = DEFAULT_DATA_ROOT
 
 BATCH_SIZE = 16
-EPOCHS = 20
+EPOCHS = 50
 LR = 1e-4
 TRAIN_RATIO = 0.8
 VAL_RATIO = 0.1
+USE_SAMPLE_STRATIFIED_SPLIT = True
+USE_WEIGHTED_SAMPLER = True
+USE_FOCAL_LOSS = True
+FOCAL_GAMMA = 2.0
 SEED = 42
 NUM_WORKERS = 0
 PIN_MEMORY = False
@@ -28,19 +34,33 @@ USE_PATCH_CACHE = True
 PREBUILD_PATCH_CACHE = True
 PATCH_CACHE_DIR = "data/vertebra_patch_cache"
 PATIENT_CACHE_SIZE = 1
-PATCH_SIZE = (96, 96, 96)
+PATCH_SIZE = (96, 96, 64)
 NORM_MODE = "zscore_sigmoid"
 ZSCORE_SCALE = 1.5
 FOREGROUND_FLOOR = 0.15
-RUN_DATE = datetime.now().strftime("%Y-%m-%d")
+
+# Output paths
+RUN_DATE = datetime.now().strftime("%Y-%m-%d:%H-%M-%S")
 OUTPUT_DIR = Path("output/stage1") / RUN_DATE
 BEST_MODEL_PATH = OUTPUT_DIR / "best.pth"
 LAST_MODEL_PATH = OUTPUT_DIR / "last.pth"
 HISTORY_PATH = OUTPUT_DIR / "history.csv"
 PARAMS_PATH = OUTPUT_DIR / "param.json"
 CURVES_PATH = OUTPUT_DIR / "curves.png"
+BEST_VAL_CONFUSION_PATH = OUTPUT_DIR / "best_val_confusion_matrix.csv"
+BEST_VAL_REPORT_PATH = OUTPUT_DIR / "best_val_classification_report.txt"
+BEST_VAL_REPORT_JSON_PATH = OUTPUT_DIR / "best_val_classification_report.json"
+TRAIN_CONFUSION_PATH = OUTPUT_DIR / "train_confusion_matrix.csv"
+TRAIN_REPORT_PATH = OUTPUT_DIR / "train_classification_report.txt"
+TRAIN_REPORT_JSON_PATH = OUTPUT_DIR / "train_classification_report.json"
+TEST_CONFUSION_PATH = OUTPUT_DIR / "test_confusion_matrix.csv"
+TEST_REPORT_PATH = OUTPUT_DIR / "test_classification_report.txt"
+TEST_REPORT_JSON_PATH = OUTPUT_DIR / "test_classification_report.json"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+NUM_CLASSES = 4
+CLASS_NAMES = ["none", "blastic", "lytic", "mixed"]
+SPLIT_MODE = "sample_stratified" if USE_SAMPLE_STRATIFIED_SPLIT else "patient_random"
 
 def build_patient_splits(dataset, train_ratio=TRAIN_RATIO, val_ratio=VAL_RATIO, seed=SEED):
     patients = dataset.df["patient_id"].astype(str).unique().tolist()
@@ -69,6 +89,40 @@ def build_patient_splits(dataset, train_ratio=TRAIN_RATIO, val_ratio=VAL_RATIO, 
     return train_idx, val_idx, test_idx
 
 
+def build_sample_stratified_splits(dataset, train_ratio=TRAIN_RATIO, val_ratio=VAL_RATIO, seed=SEED):
+    indices = list(range(len(dataset.df)))
+    labels = dataset.df["label"].astype(int).tolist()
+    test_ratio = 1.0 - train_ratio - val_ratio
+
+    train_idx, holdout_idx = train_test_split(
+        indices,
+        train_size=train_ratio,
+        random_state=seed,
+        stratify=labels,
+    )
+
+    if len(holdout_idx) == 0:
+        return sorted(train_idx), [], []
+
+    holdout_labels = [labels[i] for i in holdout_idx]
+    val_fraction_of_holdout = val_ratio / max(val_ratio + test_ratio, 1e-8)
+    val_idx, test_idx = train_test_split(
+        holdout_idx,
+        train_size=val_fraction_of_holdout,
+        random_state=seed,
+        stratify=holdout_labels,
+    )
+    return sorted(train_idx), sorted(val_idx), sorted(test_idx)
+
+
+def build_splits(dataset, split_mode=SPLIT_MODE, train_ratio=TRAIN_RATIO, val_ratio=VAL_RATIO, seed=SEED):
+    if split_mode == "patient_random":
+        return build_patient_splits(dataset, train_ratio=train_ratio, val_ratio=val_ratio, seed=seed)
+    if split_mode == "sample_stratified":
+        return build_sample_stratified_splits(dataset, train_ratio=train_ratio, val_ratio=val_ratio, seed=seed)
+    raise ValueError(f"Unknown split mode: {split_mode}")
+
+
 def make_loader(subset, shuffle=False):
     return DataLoader(
         subset,
@@ -79,14 +133,125 @@ def make_loader(subset, shuffle=False):
     )
 
 
-def run_epoch(model, loader, criterion, optimizer=None):
+def make_weighted_train_loader(dataset, indices):
+    labels = dataset.df.iloc[indices]["label"].astype(int).tolist()
+    counts = Counter(labels)
+    sample_weights = [1.0 / max(counts[label], 1) for label in labels]
+    sampler = WeightedRandomSampler(
+        weights=torch.tensor(sample_weights, dtype=torch.double),
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+    subset = Subset(dataset, indices)
+    return DataLoader(
+        subset,
+        batch_size=BATCH_SIZE,
+        sampler=sampler,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY,
+    )
+
+
+def build_report_from_confusion(conf):
+    f1_scores = []
+    per_class = []
+    eps = 1e-8
+    for c in range(conf.size(0)):
+        tp = conf[c, c].item()
+        fp = conf[:, c].sum().item() - tp
+        fn = conf[c, :].sum().item() - tp
+        support = conf[c, :].sum().item()
+        precision = tp / (tp + fp + eps)
+        recall = tp / (tp + fn + eps)
+        f1 = (2 * precision * recall) / (precision + recall + eps)
+        f1_scores.append(f1)
+        per_class.append(
+            {
+                "label": c,
+                "name": CLASS_NAMES[c] if c < len(CLASS_NAMES) else str(c),
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "support": support,
+            }
+        )
+    avg_f1 = sum(f1_scores) / len(f1_scores)
+    return avg_f1, per_class
+
+
+def save_confusion_matrix_csv(conf, path):
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["true/pred", *CLASS_NAMES])
+        for i, row in enumerate(conf.tolist()):
+            writer.writerow([CLASS_NAMES[i], *row])
+
+
+def save_classification_report(y_true, y_pred, path_txt, path_json):
+    labels = list(range(NUM_CLASSES))
+    target_names = CLASS_NAMES[:NUM_CLASSES]
+    report_dict = classification_report(
+        y_true,
+        y_pred,
+        labels=labels,
+        target_names=target_names,
+        zero_division=0,
+        digits=4,
+        output_dict=True,
+    )
+    report_text = classification_report(
+        y_true,
+        y_pred,
+        labels=labels,
+        target_names=target_names,
+        zero_division=0,
+        digits=4,
+    )
+    with open(path_txt, "w") as f:
+        f.write(report_text)
+    with open(path_json, "w") as f:
+        json.dump(report_dict, f, indent=2)
+
+
+def save_split_reports(metrics, confusion_path, report_path, report_json_path, split_name):
+    save_confusion_matrix_csv(metrics["confusion_matrix"], confusion_path)
+    save_classification_report(
+        metrics["y_true"],
+        metrics["y_pred"],
+        report_path,
+        report_json_path,
+    )
+    print(f"Saved {split_name} confusion matrix: {str(confusion_path)}")
+    print(f"Saved {split_name} classification report: {str(report_path)}")
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits, targets):
+        ce = nn.functional.cross_entropy(logits, targets, reduction="none")
+        pt = torch.exp(-ce)
+        focal_term = (1.0 - pt) ** self.gamma
+        loss = focal_term * ce
+        if self.alpha is not None:
+            alpha_t = self.alpha.to(logits.device)[targets]
+            loss = alpha_t * loss
+        return loss.mean()
+
+
+def run_epoch(model, loader, criterion, optimizer=None, collect_predictions=False):
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
 
     total_loss = 0.0
     total_correct = 0
     total_examples = 0
-    conf = torch.zeros((4, 4), dtype=torch.long)
+    conf = torch.zeros((NUM_CLASSES, NUM_CLASSES), dtype=torch.long)
+    all_true = []
+    all_pred = []
 
     for x, y in loader:
         x = x.to(DEVICE)
@@ -107,23 +272,28 @@ def run_epoch(model, loader, criterion, optimizer=None):
         preds = out.argmax(dim=1)
         total_correct += (preds == y).sum().item()
         total_examples += x.size(0)
-        for t, p in zip(y.detach().cpu(), preds.detach().cpu()):
+        y_cpu = y.detach().cpu()
+        preds_cpu = preds.detach().cpu()
+        for t, p in zip(y_cpu, preds_cpu):
             conf[int(t), int(p)] += 1
+        if collect_predictions:
+            all_true.extend(int(t) for t in y_cpu.tolist())
+            all_pred.extend(int(p) for p in preds_cpu.tolist())
 
     avg_loss = total_loss / max(total_examples, 1)
     avg_acc = total_correct / max(total_examples, 1)
-    f1_scores = []
-    eps = 1e-8
-    for c in range(conf.size(0)):
-        tp = conf[c, c].item()
-        fp = conf[:, c].sum().item() - tp
-        fn = conf[c, :].sum().item() - tp
-        precision = tp / (tp + fp + eps)
-        recall = tp / (tp + fn + eps)
-        f1 = (2 * precision * recall) / (precision + recall + eps)
-        f1_scores.append(f1)
-    avg_f1 = sum(f1_scores) / len(f1_scores)
-    return avg_loss, avg_acc, avg_f1
+    avg_f1, per_class = build_report_from_confusion(conf)
+    metrics = {
+        "loss": avg_loss,
+        "acc": avg_acc,
+        "f1": avg_f1,
+        "confusion_matrix": conf,
+        "per_class": per_class,
+    }
+    if collect_predictions:
+        metrics["y_true"] = all_true
+        metrics["y_pred"] = all_pred
+    return metrics
 
 
 def label_counts(df, indices):
@@ -166,18 +336,24 @@ if PREBUILD_PATCH_CACHE and USE_PATCH_CACHE:
     end_time = datetime.now()
     print(f"Precomputation time: {end_time - start_time}")
 
-train_idx, val_idx, test_idx = build_patient_splits(dataset)
+train_idx, val_idx, test_idx = build_splits(dataset)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 train_set = Subset(dataset, train_idx)
 val_set = Subset(dataset, val_idx)
 test_set = Subset(dataset, test_idx)
 
-train_loader = make_loader(train_set, shuffle=True)
+if USE_WEIGHTED_SAMPLER:
+    train_loader = make_weighted_train_loader(dataset, train_idx)
+else:
+    train_loader = make_loader(train_set, shuffle=True)
 val_loader = make_loader(val_set, shuffle=False)
 test_loader = make_loader(test_set, shuffle=False)
 
 print(f"Device: {DEVICE}")
+print(f"Split mode: {SPLIT_MODE}")
+print(f"Weighted sampler: {USE_WEIGHTED_SAMPLER}")
+print(f"Focal loss: {USE_FOCAL_LOSS}")
 print(f"Count: train - {len(train_set)} val - {len(val_set)} test - {len(test_set)}")
 print(f"Train label counts: {label_counts(dataset.df, train_idx)}")
 print(f"Val label counts:   {label_counts(dataset.df, val_idx)}")
@@ -195,6 +371,10 @@ params = {
     "lr": LR,
     "train_ratio": TRAIN_RATIO,
     "val_ratio": VAL_RATIO,
+    "split_mode": SPLIT_MODE,
+    "use_weighted_sampler": USE_WEIGHTED_SAMPLER,
+    "use_focal_loss": USE_FOCAL_LOSS,
+    "focal_gamma": FOCAL_GAMMA,
     "seed": SEED,
     "device": DEVICE,
     "num_workers": NUM_WORKERS,
@@ -207,7 +387,7 @@ params = {
     "norm_mode": NORM_MODE,
     "zscore_scale": ZSCORE_SCALE,
     "foreground_floor": FOREGROUND_FLOOR,
-    "num_classes": 4,
+    "num_classes": NUM_CLASSES,
     "train_samples": len(train_set),
     "val_samples": len(val_set),
     "test_samples": len(test_set),
@@ -221,36 +401,47 @@ with open(PARAMS_PATH, "w") as f:
     json.dump(params, f, indent=2)
 
 model = DenseNet121(spatial_dims=3, in_channels=1, out_channels=4).to(DEVICE)
-criterion = nn.CrossEntropyLoss(weight=class_weights.to(DEVICE))
+if USE_FOCAL_LOSS:
+    criterion = FocalLoss(alpha=class_weights.to(DEVICE), gamma=FOCAL_GAMMA)
+else:
+    criterion = nn.CrossEntropyLoss(weight=class_weights.to(DEVICE))
 optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
 history = []
 best_val_loss = float("inf")
+best_val_f1 = float("-inf")
+best_epoch = 0
 
 try:
     for epoch in range(1, EPOCHS + 1):
-        train_loss, train_acc, train_f1 = run_epoch(model, train_loader, criterion, optimizer=optimizer)
-        val_loss, val_acc, val_f1 = run_epoch(model, val_loader, criterion, optimizer=None)
+        train_metrics = run_epoch(model, train_loader, criterion, optimizer=optimizer)
+        val_metrics = run_epoch(model, val_loader, criterion, optimizer=None)
 
         row = {
             "epoch": epoch,
-            "train_loss": train_loss,
-            "train_acc": train_acc,
-            "train_f1": train_f1,
-            "val_loss": val_loss,
-            "val_acc": val_acc,
-            "val_f1": val_f1,
+            "train_loss": train_metrics["loss"],
+            "train_acc": train_metrics["acc"],
+            "train_f1": train_metrics["f1"],
+            "val_loss": val_metrics["loss"],
+            "val_acc": val_metrics["acc"],
+            "val_f1": val_metrics["f1"],
         }
         history.append(row)
 
         print(
             f"Epoch {epoch:02d} | "
-            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} train_f1={train_f1:.4f} | "
-            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} val_f1={val_f1:.4f}"
+            f"train_loss={train_metrics['loss']:.4f} train_acc={train_metrics['acc']:.4f} train_f1={train_metrics['f1']:.4f} | "
+            f"val_loss={val_metrics['loss']:.4f} val_acc={val_metrics['acc']:.4f} val_f1={val_metrics['f1']:.4f}"
         )
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        is_better = (
+            val_metrics["f1"] > best_val_f1
+            or (val_metrics["f1"] == best_val_f1 and val_metrics["loss"] < best_val_loss)
+        )
+        if is_better:
+            best_val_f1 = val_metrics["f1"]
+            best_val_loss = val_metrics["loss"]
+            best_epoch = epoch
             try:
                 torch.save(
                     {
@@ -258,10 +449,14 @@ try:
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "best_val_loss": best_val_loss,
+                        "best_val_f1": best_val_f1,
                     },
                     BEST_MODEL_PATH,
                 )
-                print(f"Saved new best model at epoch {epoch} -> {str(BEST_MODEL_PATH)}")
+                print(
+                    f"Saved new best model at epoch {epoch} "
+                    f"(val_f1={best_val_f1:.4f}, val_loss={best_val_loss:.4f}) -> {str(BEST_MODEL_PATH)}"
+                )
             except Exception as save_err:
                 print(f"[WARN] Could not save best model checkpoint: {save_err}")
 
@@ -297,6 +492,7 @@ try:
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "best_val_loss": best_val_loss,
+            "best_val_f1": best_val_f1,
         },
         LAST_MODEL_PATH,
     )
@@ -338,12 +534,48 @@ if BEST_MODEL_PATH.exists():
     ckpt = torch.load(BEST_MODEL_PATH, map_location=DEVICE)
     model.load_state_dict(ckpt["model_state_dict"])
 
-test_loss, test_acc, test_f1 = run_epoch(model, test_loader, criterion, optimizer=None)
-print(f"Test metrics | loss={test_loss:.4f} acc={test_acc:.4f} f1={test_f1:.4f}")
+train_metrics = run_epoch(model, train_loader, criterion, optimizer=None, collect_predictions=True)
+save_split_reports(
+    train_metrics,
+    TRAIN_CONFUSION_PATH,
+    TRAIN_REPORT_PATH,
+    TRAIN_REPORT_JSON_PATH,
+    "train",
+)
+
+best_val_metrics = run_epoch(model, val_loader, criterion, optimizer=None, collect_predictions=True)
+save_split_reports(
+    best_val_metrics,
+    BEST_VAL_CONFUSION_PATH,
+    BEST_VAL_REPORT_PATH,
+    BEST_VAL_REPORT_JSON_PATH,
+    "best-val",
+)
+
+test_metrics = run_epoch(model, test_loader, criterion, optimizer=None, collect_predictions=True)
+save_split_reports(
+    test_metrics,
+    TEST_CONFUSION_PATH,
+    TEST_REPORT_PATH,
+    TEST_REPORT_JSON_PATH,
+    "test",
+)
+print(
+    f"Test metrics | loss={test_metrics['loss']:.4f} "
+    f"acc={test_metrics['acc']:.4f} f1={test_metrics['f1']:.4f}"
+)
 
 params["best_val_loss"] = best_val_loss
-params["test_loss"] = test_loss
-params["test_acc"] = test_acc
-params["test_f1"] = test_f1
+params["best_val_f1"] = best_val_f1
+params["best_epoch"] = best_epoch
+params["train_loss"] = train_metrics["loss"]
+params["train_acc"] = train_metrics["acc"]
+params["train_f1"] = train_metrics["f1"]
+params["val_loss_at_best"] = best_val_metrics["loss"]
+params["val_acc_at_best"] = best_val_metrics["acc"]
+params["val_f1_at_best"] = best_val_metrics["f1"]
+params["test_loss"] = test_metrics["loss"]
+params["test_acc"] = test_metrics["acc"]
+params["test_f1"] = test_metrics["f1"]
 with open(PARAMS_PATH, "w") as f:
     json.dump(params, f, indent=2)

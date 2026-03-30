@@ -46,7 +46,14 @@ def parse_args():
     )
     parser.add_argument("--wl", type=float, default=300.0, help="CT window level in HU (default: bone preset).")
     parser.add_argument("--ww", type=float, default=1500.0, help="CT window width in HU (default: bone preset).")
-    parser.add_argument("--patch-size", type=int, default=96, help="Cubic patch size (N => NxNxN).")
+    parser.add_argument(
+        "--patch-size",
+        type=int,
+        nargs=3,
+        default=(96, 96, 64),
+        metavar=("SX", "SY", "SZ"),
+        help="Patch size as three dimensions, e.g. --patch-size 96 96 64.",
+    )
     parser.add_argument("--seg-alpha", type=float, default=0.45, help="Segmentation overlay opacity.")
     parser.add_argument(
         "--norm-mode",
@@ -95,7 +102,7 @@ def main():
         use_patch_cache=True,
         cache_dir=args.cache_dir,
         patient_cache_size=1,
-        patch_size=(args.patch_size, args.patch_size, args.patch_size),
+        patch_size=tuple(args.patch_size),
         norm_mode=args.norm_mode,
         zscore_scale=args.zscore_scale,
         foreground_floor=args.foreground_floor,

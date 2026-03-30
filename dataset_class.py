@@ -73,7 +73,7 @@ class VertebraDataset(Dataset):
         use_patch_cache=True,
         cache_dir="data/vertebra_patch_cache",
         patient_cache_size=8,
-        patch_size=(96, 96, 96),
+        patch_size=(96, 96, 64),
         norm_mode="zscore_sigmoid",
         zscore_scale=1.5,
         foreground_floor=0.45,
@@ -97,7 +97,8 @@ class VertebraDataset(Dataset):
         return len(self.df)
 
     def _cache_path(self, pid, vname):
-        return self.cache_dir / f"{pid}_{vname}.npy"
+        sx, sy, sz = self.patch_size
+        return self.cache_dir / f"{pid}_{vname}_{sx}x{sy}x{sz}.npy"
 
     def _get_patient_arrays(self, pid):
         if pid in self._patient_cache:
@@ -237,6 +238,7 @@ if __name__ == "__main__":
     print(f"Dataset size: {len(dataset)}")
     patch, label = dataset[0]
     print(f"Patch shape: {patch.shape}, Label: {label}")
+    
     
     
     

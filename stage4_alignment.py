@@ -181,10 +181,10 @@ def run(root, translation_thresh_mm, scoliosis_max_dev_mm, kyphosis_max_dev_mm):
             all_flags.append(f)
 
     df_sum = pd.DataFrame(summaries)
-    df_sum.to_csv("stage4_alignment.csv", index=False)
+    df_sum.to_csv("output/stage4_alignment.csv", index=False)
 
     df_flags = pd.DataFrame(all_flags)
-    df_flags.to_csv("stage4_subluxation_flags.csv", index=False)
+    df_flags.to_csv("output/stage4_subluxation_flags.csv", index=False)
 
     print("Saved stage4_alignment.csv")
     print("Saved stage4_subluxation_flags.csv")
