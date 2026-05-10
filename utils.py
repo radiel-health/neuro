@@ -11,7 +11,7 @@ VERTEBRA_LABELS = {
 INV_LABELS = {v: k for k, v in VERTEBRA_LABELS.items()}
 VERTEBRAE = list(VERTEBRA_LABELS.keys())
 
-DEFAULT_DATA_ROOT = "data/Spine-Mets-CT-SEG-Nifti"
+DEFAULT_DATA_ROOT = "../../datasets/radiel/Spine-Mets-CT-SEG-Nifti"
 
 def load_img(path, canonical=True):
     img = nib.load(path)
