@@ -48,6 +48,16 @@ def fit_quad(z, v):
     return (a2, a1, a0), pred, resid
 
 
+def fit_cubic(z, v):
+    z = np.asarray(z, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+    degree = min(3, max(len(z) - 1, 1))
+    coef = np.polyfit(z, v, degree)
+    pred = np.polyval(coef, z)
+    resid = v - pred
+    return tuple(float(c) for c in coef), pred, resid
+
+
 def local_subluxation_flags(levels, x, y, z, thresh_mm):
     """
     levels is list of integer labels 1..17, sorted by z descending or ascending
@@ -118,9 +128,9 @@ def compute_patient_alignment(seg_path, translation_thresh_mm, scoliosis_max_dev
     _, _, _, resid_x_line = fit_line(z, x)
     coronal_max_dev = float(np.max(np.abs(resid_x_line)))
 
-    # sagittal analysis: y versus z with quadratic smooth curve
-    _, _, resid_y_quad = fit_quad(z, y)
-    sagittal_max_dev = float(np.max(np.abs(resid_y_quad)))
+    # sagittal analysis: y versus z with cubic smooth curve when enough vertebrae exist.
+    _, _, resid_y_cubic = fit_cubic(z, y)
+    sagittal_max_dev = float(np.max(np.abs(resid_y_cubic)))
 
     # local subluxation or translation: large local displacement compared to neighbors
     flags = local_subluxation_flags(labs, x, y, z, translation_thresh_mm)
@@ -147,6 +157,76 @@ def compute_patient_alignment(seg_path, translation_thresh_mm, scoliosis_max_dev
     }
 
     return summary, flags
+
+
+def analyze_patient_alignment_geometry(seg_path, translation_thresh_mm=6.0, scoliosis_max_dev_mm=10.0, kyphosis_max_dev_mm=10.0):
+    seg, aff = load_seg(seg_path)
+    label_ijk = build_label_ijk_map(seg)
+
+    pts = []
+    for lab in range(1, 18):
+        ijk = label_ijk.get(lab, np.empty((0, 3), dtype=np.int64))
+        c = centroid_world_from_ijk(ijk, aff)
+        if c is not None:
+            pts.append((lab, c[0], c[1], c[2]))
+
+    if len(pts) < 5:
+        return None
+
+    pts = sorted(pts, key=lambda t: t[3])
+    labs = np.asarray([p[0] for p in pts], dtype=np.int32)
+    x = np.asarray([p[1] for p in pts], dtype=np.float64)
+    y = np.asarray([p[2] for p in pts], dtype=np.float64)
+    z = np.asarray([p[3] for p in pts], dtype=np.float64)
+
+    line_a, line_b, x_fit, resid_x = fit_line(z, x)
+    cubic_coef, y_fit, resid_y = fit_cubic(z, y)
+    fitted_xyz = np.column_stack((x_fit, y_fit, z))
+    center_xyz = np.column_stack((x, y, z))
+    deviation = np.sqrt((x - x_fit) ** 2 + (y - y_fit) ** 2)
+
+    z_dense = np.linspace(float(z.min()), float(z.max()), 160)
+    x_dense = line_a * z_dense + line_b
+    y_dense = np.polyval(np.asarray(cubic_coef, dtype=np.float64), z_dense)
+    fitted_dense_xyz = np.column_stack((x_dense, y_dense, z_dense))
+
+    flags = local_subluxation_flags(labs, x, y, z, translation_thresh_mm)
+    coronal_max_dev = float(np.max(np.abs(resid_x)))
+    sagittal_max_dev = float(np.max(np.abs(resid_y)))
+    has_sublux = len(flags) > 0
+    has_curve = (coronal_max_dev >= scoliosis_max_dev_mm) or (sagittal_max_dev >= kyphosis_max_dev_mm)
+    if has_sublux:
+        score = 4
+    elif has_curve:
+        score = 2
+    else:
+        score = 0
+
+    summary = {
+        "coronal_max_dev_mm": coronal_max_dev,
+        "sagittal_max_dev_mm": sagittal_max_dev,
+        "has_subluxation": int(has_sublux),
+        "has_curve_deviation": int(has_curve),
+        "alignment_score": int(score),
+        "n_vertebrae_found": int(len(pts)),
+        "line_x_coef": (line_a, line_b),
+        "cubic_y_coef": cubic_coef,
+    }
+
+    return {
+        "summary": summary,
+        "flags": flags,
+        "labels": labs,
+        "vertebrae": [INV_LABELS[int(lab)] for lab in labs],
+        "centers": center_xyz,
+        "fitted": fitted_xyz,
+        "fitted_dense": fitted_dense_xyz,
+        "residual_x": resid_x,
+        "residual_y": resid_y,
+        "deviation_mm": deviation,
+        "seg": seg,
+        "affine": aff,
+    }
 
 
 def run(root, translation_thresh_mm, scoliosis_max_dev_mm, kyphosis_max_dev_mm):

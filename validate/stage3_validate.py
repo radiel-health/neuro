@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 from vedo import Line, Points, Sphere, Text2D, show
 
-from stage3_postlateral import analyze_posterolateral_from_ijk, prepare_ct_seg_arrays, resolve_thresholds
+from pipeline.scripts.stage3_postlateral import analyze_posterolateral_from_ijk, prepare_ct_seg_arrays, resolve_thresholds
 from utils import DEFAULT_DATA_ROOT, VERTEBRA_LABELS, load_img
 
 

@@ -88,7 +88,7 @@ def resample_mask_to_gt_grid(mask, mask_aff, gt_shape, gt_aff):
 
 
 def load_mask_zyx_resampled_to_target(mask_path, target_img):
-    src = nib.load(str(mask_path))
+    src = nib.as_closest_canonical(nib.load(str(mask_path)))
     if src.shape != target_img.shape or not np.allclose(src.affine, target_img.affine, atol=1e-5):
         src = resample_from_to(src, target_img, order=0)
     arr_xyz = np.asanyarray(src.dataobj)
@@ -231,16 +231,22 @@ def show_patient(
 ):
     actors = []
     title_lines = []
-    spacing_xyz = None
-    spacing_zyx = None
     gt_path = Path(gt_path)
-    gt_img_raw = nib.load(str(gt_path))
-    ct_img_raw = None
+    gt_img = nib.as_closest_canonical(nib.load(str(gt_path)))
+    ct_img = None
 
     if ct_path is not None and Path(ct_path).exists():
         ct_path = Path(ct_path)
-        ct_img_raw = nib.load(str(ct_path))
-        ct_zyx, gt_seg_zyx, spacing_xyz = _load_ct_and_seg_aligned(str(ct_path), str(gt_path))
+        ct_img = nib.as_closest_canonical(nib.load(str(ct_path)))
+        target_img = ct_img
+        gt_for_display = gt_img
+        if gt_for_display.shape != target_img.shape or not np.allclose(gt_for_display.affine, target_img.affine, atol=1e-5):
+            gt_for_display = resample_from_to(gt_for_display, target_img, order=0)
+
+        ct_xyz = np.asanyarray(ct_img.dataobj).astype(np.float32)
+        ct_zyx = np.transpose(ct_xyz, (2, 1, 0))
+        gt_seg_zyx = np.transpose(np.asanyarray(gt_for_display.dataobj).astype(np.int16), (2, 1, 0))
+        spacing_xyz = spacing_xyz_from_aff(target_img.affine)
         spacing_zyx = (float(spacing_xyz[2]), float(spacing_xyz[1]), float(spacing_xyz[0]))
         wl = float(ct_wl)
         ww = max(float(ct_ww), 1.0)
@@ -255,9 +261,9 @@ def show_patient(
         )
         actors.append(ct_actor)
     else:
-        gt_img = nib.as_closest_canonical(nib.load(str(gt_path)))
-        gt_seg_zyx = np.transpose(np.asanyarray(gt_img.dataobj).astype(np.int16), (2, 1, 0))
-        spacing_xyz = spacing_xyz_from_aff(gt_img.affine)
+        target_img = gt_img
+        gt_seg_zyx = np.transpose(np.asanyarray(target_img.dataobj).astype(np.int16), (2, 1, 0))
+        spacing_xyz = spacing_xyz_from_aff(target_img.affine)
         spacing_zyx = (float(spacing_xyz[2]), float(spacing_xyz[1]), float(spacing_xyz[0]))
 
     for vertebra, gt_mask, gt_aff, ts_mask, ts_aff, gt_cent, ts_cent, row in viz:
@@ -265,7 +271,6 @@ def show_patient(
         gt_disp = (gt_seg_zyx == lab)
         ts_disp = None
         if row["ts_file"]:
-            target_img = ct_img_raw if ct_img_raw is not None else gt_img_raw
             ts_disp = load_mask_zyx_resampled_to_target(row["ts_file"], target_img)
 
         if not hide_gt and gt_disp is not None and np.count_nonzero(gt_disp) > 0:
@@ -287,9 +292,6 @@ def show_patient(
         title_lines.append(
             f"{vertebra}: dice={row['dice']:.3f}, iou={row['iou']:.3f}, ctr={row['centroid_dist_mm']:.1f} mm"
         )
-
-    for actor in actors:
-        actor.rotate_y(-90)
 
     actors.append(
         Text2D(

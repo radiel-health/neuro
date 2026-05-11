@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 from vedo import Line, Points, Sphere, Text2D, show
 
-from stage2_collapse import analyze_height_geometry, build_label_ijk_map
+from pipeline.scripts.stage2_collapse import analyze_height_geometry, build_label_ijk_map
 from utils import DEFAULT_DATA_ROOT, VERTEBRA_LABELS, load_seg
 
 

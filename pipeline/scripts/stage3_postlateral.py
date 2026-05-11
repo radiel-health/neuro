@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from scipy import ndimage
 
-from stage2_collapse import analyze_height_geometry
+from pipeline.scripts.stage2_collapse import analyze_height_geometry
 from utils import INV_LABELS, load_img, vox2world
 
 
